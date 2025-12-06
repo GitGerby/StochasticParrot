@@ -9,78 +9,20 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	pc "github.com/gitgerby/stochasticparrot/internal/pkg/config"
+	pc "keemnun.somuchcrypto.com/gearnsc/llm-tooling/autoreview/internal/pkg/config"
 )
 
-// GiteaWebhookPayload represents the structure of Gitea webhook payload for pull requests
-type GiteaWebhookPayload struct {
-	Action      string `json:"action"`
-	PullRequest struct {
-		ID      int    `json:"id"`
-		Number  int    `json:"number"`
-		Title   string `json:"title"`
-		DiffURL string `json:"diff_url"`
-		Head    struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
-		} `json:"head"`
-		Base struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
-		} `json:"base"`
-		RequestedReviewers []GiteaReviewer `json:"requested_reviewers"`
-		HTMLURL            string          `json:"html_url"`
-	} `json:"pull_request"`
-	Repository struct {
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-		URL      string `json:"url"`
-	} `json:"repository"`
-	Sender struct {
-		Login string `json:"login"`
-	} `json:"sender"`
-	RequestedReviewer GiteaReviewer `json:"requested_reviewer"`
-}
-
-type GiteaReviewer struct {
-	Username string `json:"username"`
-}
-
-// OpenAIRequest represents the request to OpenAI-compatible endpoint
-type OpenAIRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	MaxTokens   int       `json:"max_tokens"`
-}
-
-// Message represents a message in OpenAI request
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// OpenAIResponse represents the response from OpenAI-compatible endpoint
-type OpenAIResponse struct {
-	Choices []struct {
-		Message Message `json:"message"`
-	} `json:"choices"`
-}
-
-// GiteaComment represents a comment to be posted on Gitea
-type GiteaComment struct {
-	Body        string `json:"body"`
-	ReviewState string `json:"event"`
-}
-
-var config pc.ParrotConfig
-
 var (
+	config      pc.ParrotConfig
 	debugConfig = flag.Bool("debug", false, "Enable debug mode")
+
+	// some LLMs absolutely refuse to return a raw json object without wrapping it in markdown tags; make an attempt here to extract the encoded response.
+	jsonRespRegex = regexp.MustCompile(`(?i)(?:^\x60\x60\x60(?:json)?)?[\s]*({[\s]*"body":[\w\W]*})(?:[\s]*\x60\x60\x60$)?`)
 )
 
 func main() {
@@ -159,21 +101,21 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Processing PR #%d: %s", payload.PullRequest.Number, payload.PullRequest.Title)
 
-	if *config.GiteaToken == "" || *config.OpenAIToken == "" || *config.OpenAIEndpoint == "" {
+	if *config.GiteaToken == "" || *config.LLMToken == "" || *config.LLMEndpoint == "" {
 		log.Fatal("Missing required configuration")
 	}
 
-	// Fetch diff from Gitea
-	diff, err := fetchDiff(*config.GiteaToken, payload)
+	// Fetch PR details from Gitea
+	prDetails, err := fetchPRMeta(*config.GiteaToken, payload)
 	if err != nil {
-		log.Printf("Error fetching diff: %v", err)
+		log.Printf("Error fetching PR: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	// Get review from API Endpoint
 	log.Print("Requesting review from LLM")
-	review, err := getReview(*config.OpenAIToken, *config.OpenAIEndpoint, diff)
+	review, err := getReview(*config.LLMToken, *config.LLMEndpoint, prDetails)
 	if err != nil {
 		log.Printf("Error getting review: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -222,26 +164,85 @@ func fetchDiff(token string, payload GiteaWebhookPayload) (string, error) {
 	return string(body), nil
 }
 
-func getReview(token, endpoint, diff string) (string, error) {
-	// Create prompt for OpenAI
-	prompt := fmt.Sprintf(*config.ReviewPrompt, diff)
+func fetchPRMeta(token string, payload GiteaWebhookPayload) (*GiteaPRDetails, error) {
+	// Gitea API endpoint for pull request metadata
+	url := fmt.Sprintf("%s/pulls/%d", payload.Repository.URL, payload.PullRequest.Number)
 
-	// Prepare OpenAI request
-	openaiReq := OpenAIRequest{
-		Model: "gpt-4", // or your preferred model
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "token "+token)
+
+	log.Printf("Fetching PR metadata from Gitea: %q", url)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch diff: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var prd GiteaPRDetails
+	if err := json.Unmarshal(body, &prd); err != nil {
+		return nil, err
+	}
+
+	prd.Diff, err = fetchDiff(token, payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch diff: %w", err)
+	}
+
+	return &prd, nil
+}
+
+func getReview(token, endpoint string, pullRequest *GiteaPRDetails) (*GiteaReviewResponse, error) {
+	// Create embed PR details in the user role message for the LLM.
+	prPrompt := fmt.Sprintf(*config.UserPrompt, pullRequest.Title, pullRequest.Description, pullRequest.Diff)
+
+	// Prepare LLM request
+	llmReq := LLMRequest{
+		Model: *config.Model,
 		Messages: []Message{
 			{
+				Role:    "system",
+				Content: *config.SystemPrompt,
+			},
+			{
 				Role:    "user",
-				Content: prompt,
+				Content: prPrompt,
 			},
 		},
 		Temperature: 0.7,
 		MaxTokens:   2000,
+		Format: LLMFormat{
+			FormatType: "json_schema",
+			Strict:     true,
+			Schema: `{
+  "body": "string",
+  "comments": [
+    {
+      "body": "string",
+      "new_position": 0,
+      "path": "string"
+    }
+  ],
+  "event": "string"
+}`,
+		},
 	}
 
-	jsonData, err := json.Marshal(openaiReq)
+	jsonData, err := json.Marshal(llmReq)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Send request to OpenAI-compatible endpoint
@@ -253,7 +254,7 @@ func getReview(token, endpoint, diff string) (string, error) {
 	}
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -261,47 +262,60 @@ func getReview(token, endpoint, diff string) (string, error) {
 	client := &http.Client{Timeout: time.Duration(*config.LLMTimeout) * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("OpenAI API error: %d", resp.StatusCode)
+		return nil, fmt.Errorf("LLM API error: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	var openaiResp OpenAIResponse
-	if err := json.Unmarshal(body, &openaiResp); err != nil {
-		return "", err
+	var llmResp LLMResponse
+	if err := json.Unmarshal(body, &llmResp); err != nil {
+		return nil, err
 	}
 
-	if len(openaiResp.Choices) == 0 {
-		return "", fmt.Errorf("no response from OpenAI")
+	if len(llmResp.Choices) == 0 {
+		return nil, fmt.Errorf("no response from LLM")
 	}
 
-	return openaiResp.Choices[0].Message.Content, nil
+	var reviewResponse GiteaReviewResponse
+	if err := json.Unmarshal([]byte(llmResp.Choices[0].Message.Content), &reviewResponse); err != nil {
+		log.Println("failed to unmarshall raw LLM response; attempting blob extraction")
+		return llmRespCleanup(llmResp.Choices[0].Message.Content)
+	}
+
+	return &reviewResponse, nil
 }
 
-func postComment(token string, payload GiteaWebhookPayload, review string) error {
+func llmRespCleanup(resp string) (*GiteaReviewResponse, error) {
+	matches := jsonRespRegex.FindStringSubmatch(resp)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("failed to extract json from LLM response")
+	}
+	var rr GiteaReviewResponse
+	if err := json.Unmarshal([]byte(matches[1]), &rr); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cleaned json: %v", err)
+	}
+	return &rr, nil
+}
+
+func postComment(token string, payload GiteaWebhookPayload, review *GiteaReviewResponse) error {
 	// Format comment
-	commentBody := fmt.Sprintf(`## Automated Code Review
+	review.Body = fmt.Sprintf(`## Automated Code Review
 
 %s
 
 *This review was automatically generated by the code review bot.*
 
-`, review)
+`, review.Body)
 
-	comment := GiteaComment{
-		Body:        commentBody,
-		ReviewState: "APPROVED",
-	}
-
-	jsonData, err := json.Marshal(comment)
+	jsonData, err := json.Marshal(review)
 	if err != nil {
 		return err
 	}

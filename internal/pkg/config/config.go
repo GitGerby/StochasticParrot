@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"errors"
 	"io/fs"
 	"os"
@@ -10,9 +11,10 @@ import (
 
 type ParrotConfig struct {
 	GiteaToken         *string `yaml:"gitea_token"`
-	OpenAIEndpoint     *string `yaml:"openai_endpoint"`
-	OpenAIToken        *string `yaml:"openai_token"`
-	ReviewPrompt       *string `yaml:"review_prompt"`
+	LLMEndpoint        *string `yaml:"llm_endpoint"`
+	LLMToken           *string `yaml:"llm_token"`
+	SystemPrompt       *string `yaml:"system_prompt"`
+	UserPrompt         *string
 	InsecureSkipVerify *bool   `yaml:"insecure_skip_tls_verify"`
 	Port               *int    `yaml:"port"`
 	LLMTimeout         *int    `yaml:"llm_timeout"`
@@ -21,9 +23,9 @@ type ParrotConfig struct {
 }
 
 const (
-	ErrMissingGiteaToken     = "gitea_token must not be nil"
-	ErrMissingOpenAIEndpoint = "openai_endpoint must not be nil"
-	ErrMissingOpenAIToken    = "openai_token must not be nil"
+	ErrMissingGiteaToken  = "gitea_token must not be nil"
+	ErrMissingLLMEndpoint = "llm_endpoint must not be nil"
+	ErrMissingLLMToken    = "llm_token must not be nil"
 )
 
 func (c *ParrotConfig) Parse(path string) error {
@@ -43,32 +45,24 @@ func (c *ParrotConfig) loadConfig(configFile fs.File) error {
 		return err
 	}
 
-	if tempConfig.GiteaToken == nil {
+	c.GiteaToken = cmp.Or(tempConfig.GiteaToken, &[]string{os.Getenv("GITEA_TOKEN")}[0])
+	if *c.GiteaToken == "" {
 		return errors.New(ErrMissingGiteaToken)
 	}
-	c.GiteaToken = tempConfig.GiteaToken
 
-	if tempConfig.OpenAIEndpoint == nil {
-		return errors.New(ErrMissingOpenAIEndpoint)
-	}
-	c.OpenAIEndpoint = tempConfig.OpenAIEndpoint
-
-	if tempConfig.OpenAIToken == nil {
-		return errors.New(ErrMissingOpenAIToken)
-	}
-	c.OpenAIToken = tempConfig.OpenAIToken
-
-	if tempConfig.ReviewPrompt == nil {
-		c.ReviewPrompt = &[]string{defaultReviewPrompt}[0]
-	} else {
-		c.ReviewPrompt = tempConfig.ReviewPrompt
+	c.LLMEndpoint = cmp.Or(tempConfig.LLMEndpoint, &[]string{os.Getenv("LLM_ENDPOINT")}[0])
+	if *c.LLMEndpoint == "" {
+		return errors.New(ErrMissingLLMEndpoint)
 	}
 
-	if tempConfig.InsecureSkipVerify != nil {
-		c.InsecureSkipVerify = tempConfig.InsecureSkipVerify
-	} else {
-		c.InsecureSkipVerify = &[]bool{false}[0]
+	c.LLMToken = cmp.Or(tempConfig.LLMEndpoint, &[]string{os.Getenv("LLM_TOKEN")}[0])
+	if *c.LLMToken == "" {
+		return errors.New(ErrMissingLLMToken)
 	}
+
+	c.SystemPrompt = cmp.Or(tempConfig.SystemPrompt, &[]string{defaultSystemPrompt}[0])
+
+	c.InsecureSkipVerify = cmp.Or(tempConfig.InsecureSkipVerify, &[]bool{false}[0])
 
 	if tempConfig.Port != nil && (*tempConfig.Port > 0 && *tempConfig.Port < 65535) {
 		c.Port = tempConfig.Port
@@ -87,17 +81,11 @@ func (c *ParrotConfig) loadConfig(configFile fs.File) error {
 		c.LLMTimeout = &[]int{defaultLLMTimeout}[0]
 	}
 
-	if tempConfig.GiteaUsername != nil {
-		c.GiteaUsername = tempConfig.GiteaUsername
-	} else {
-		c.GiteaUsername = &[]string{""}[0]
-	}
+	c.GiteaUsername = cmp.Or(tempConfig.GiteaUsername, &[]string{""}[0])
 
-	if tempConfig.Model != nil {
-		c.Model = tempConfig.Model
-	} else {
-		c.Model = &[]string{"gemini-2.5-pro"}[0]
-	}
+	c.Model = cmp.Or(tempConfig.Model, &[]string{defaultLLMModel}[0])
+
+	c.UserPrompt = &[]string{defaultUserPrompt}[0]
 
 	return nil
 }
