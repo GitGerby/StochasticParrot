@@ -15,11 +15,12 @@ type ParrotConfig struct {
 	LLMToken           *string `yaml:"llm_token"`
 	SystemPrompt       *string `yaml:"system_prompt"`
 	UserPrompt         *string
-	InsecureSkipVerify *bool   `yaml:"insecure_skip_tls_verify"`
-	Port               *int    `yaml:"port"`
-	LLMTimeout         *int    `yaml:"llm_timeout"`
-	GiteaUsername      *string `yaml:"gitea_username"`
-	Model              *string `yaml:"model"`
+	InsecureSkipVerify *bool    `yaml:"insecure_skip_tls_verify"`
+	Port               *int     `yaml:"port"`
+	LLMTimeout         *int     `yaml:"llm_timeout"`
+	GiteaUsername      *string  `yaml:"gitea_username"`
+	Model              *string  `yaml:"model"`
+	Temperature        *float64 `yaml:"temperature"`
 }
 
 const (
@@ -86,6 +87,8 @@ func (c *ParrotConfig) loadConfig(configFile fs.File) error {
 	c.Model = cmp.Or(tempConfig.Model, &[]string{defaultLLMModel}[0])
 
 	c.UserPrompt = &[]string{defaultUserPrompt}[0]
+
+	c.Temperature = cmp.Or(tempConfig.Temperature, &[]float64{defaultTemperature}[0])
 
 	return nil
 }

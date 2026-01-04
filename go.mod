@@ -1,4 +1,4 @@
-module keemnun.somuchcrypto.com/gearnsc/llm-tooling/autoreview
+module github.com/gitgerby/stochasticparrot
 
 go 1.25.1
 

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	pc "keemnun.somuchcrypto.com/gearnsc/llm-tooling/autoreview/internal/pkg/config"
+	pc "github.com/gitgerby/stochasticparrot/internal/pkg/config"
 )
 
 var (
@@ -23,6 +23,9 @@ var (
 
 	// some LLMs absolutely refuse to return a raw json object without wrapping it in markdown tags; make an attempt here to extract the encoded response.
 	jsonRespRegex = regexp.MustCompile(`(?i)(?:^\x60\x60\x60(?:json)?)?[\s]*({[\s]*"body":[\w\W]*})(?:[\s]*\x60\x60\x60$)?`)
+
+	// TODO(GitGerby): make this configurable.
+	reviewQueue = make(chan queuedRequest, 1000)
 )
 
 func main() {
@@ -42,6 +45,13 @@ func main() {
 	if *debugConfig {
 		log.Printf("%+v", config)
 	}
+
+	if *config.GiteaToken == "" || *config.LLMToken == "" || *config.LLMEndpoint == "" {
+		log.Fatal("Missing required configuration")
+	}
+
+	go processReviews()
+	log.Print("reviewer thread started")
 
 	http.HandleFunc("/webhook", handleWebhook)
 	log.Printf("Server starting on port %d", *config.Port)
@@ -101,10 +111,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Processing PR #%d: %s", payload.PullRequest.Number, payload.PullRequest.Title)
 
-	if *config.GiteaToken == "" || *config.LLMToken == "" || *config.LLMEndpoint == "" {
-		log.Fatal("Missing required configuration")
-	}
-
 	// Fetch PR details from Gitea
 	prDetails, err := fetchPRMeta(*config.GiteaToken, payload)
 	if err != nil {
@@ -113,25 +119,18 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get review from API Endpoint
-	log.Print("Requesting review from LLM")
-	review, err := getReview(*config.LLMToken, *config.LLMEndpoint, prDetails)
-	if err != nil {
-		log.Printf("Error getting review: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+	select {
+	case reviewQueue <- queuedRequest{
+		prDetails: prDetails,
+		payload:   payload,
+	}:
+		postComment(payload, "Queued for review.")
+		fmt.Fprintf(w, "Successfully queued PR #%d for review", payload.PullRequest.Number)
+		w.WriteHeader(http.StatusOK)
+	default:
+		postComment(payload, "Failed to queue PR for review, too many items in queue.")
+		http.Error(w, "Review Queue is Full", http.StatusInternalServerError)
 	}
-
-	// Post comment to Gitea
-	log.Print("Posting reply")
-	if err := postComment(*config.GiteaToken, payload, review); err != nil {
-		log.Printf("Error posting comment: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Successfully processed PR #%d", payload.PullRequest.Number)
 }
 
 func fetchDiff(token string, payload GiteaWebhookPayload) (string, error) {
@@ -221,8 +220,8 @@ func getReview(token, endpoint string, pullRequest *GiteaPRDetails) (*GiteaRevie
 				Content: prPrompt,
 			},
 		},
-		Temperature: 0.7,
-		MaxTokens:   2000,
+		Temperature: *config.Temperature,
+		MaxTokens:   5000,
 		Format: LLMFormat{
 			FormatType: "json_schema",
 			Strict:     true,
@@ -232,6 +231,7 @@ func getReview(token, endpoint string, pullRequest *GiteaPRDetails) (*GiteaRevie
     {
       "body": "string",
       "new_position": 0,
+			"old_position": 0,
       "path": "string"
     }
   ],
@@ -305,7 +305,7 @@ func llmRespCleanup(resp string) (*GiteaReviewResponse, error) {
 	return &rr, nil
 }
 
-func postComment(token string, payload GiteaWebhookPayload, review *GiteaReviewResponse) error {
+func postReview(payload GiteaWebhookPayload, review *GiteaReviewResponse) error {
 	// Format comment
 	review.Body = fmt.Sprintf(`## Automated Code Review
 
@@ -327,7 +327,7 @@ func postComment(token string, payload GiteaWebhookPayload, review *GiteaReviewR
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Authorization", "token "+*config.GiteaToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -343,4 +343,61 @@ func postComment(token string, payload GiteaWebhookPayload, review *GiteaReviewR
 	}
 
 	return nil
+}
+
+func postComment(targetPr GiteaWebhookPayload, comment string) error {
+	// generate url for post
+	url := fmt.Sprintf("%s/pulls/%d/reviews", targetPr.Repository.URL, targetPr.PullRequest.Number)
+
+	jsonData, err := json.Marshal(GiteaReviewResponse{
+		Body: fmt.Sprintf("%v\n*Automated reply from: %v*", comment, *config.GiteaUsername),
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "token "+*config.GiteaToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to post comment: %d - %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+func processReviews() {
+	for {
+		rr := <-reviewQueue
+		// Get review from API Endpoint
+		log.Print("Requesting review from the LLM.")
+		postComment(rr.payload, "Beginning review.")
+		review, err := getReview(*config.LLMToken, *config.LLMEndpoint, rr.prDetails)
+		if err != nil {
+			log.Printf("Error getting review: %v", err)
+			postComment(rr.payload, "The LLM failed to review the PR.")
+		}
+
+		if *debugConfig {
+			log.Printf("LLM Response:\n%#v", review)
+		}
+
+		// Post comment to Gitea
+		log.Print("Posting reply")
+		if err := postReview(rr.payload, review); err != nil {
+			log.Printf("Error posting comment: %v", err)
+		}
+	}
 }
